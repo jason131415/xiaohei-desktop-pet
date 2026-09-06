@@ -58,14 +58,23 @@
 
 ### 源码运行
 
-需要 Python 3.10+：
+需要 Python 3.10+。推荐使用虚拟环境：
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+pip install Pillow
+python pet.py
+```
+
+或直接全局安装：
 
 ```bash
 pip install Pillow
 python pet.py
 ```
 
-或双击 `start.bat`。
+也可以双击 `start.bat`（会优先使用项目本地 `.venv`，没有则用系统 Python）。
 
 ### 打包 exe
 
