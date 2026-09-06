@@ -65,7 +65,7 @@ FRAMES_DIR = os.path.join(ASSETS_DIR, "frames")
 # Idle 动画帧：6 帧（坐 / 闭眼 / 打哈欠 / 舔 / 伸懒腰 / 举爪挥手），由行为状态机选择
 IDLE_FRAME_FILES = ("frame_0_sit.png", "frame_1_blink.png",
                     "frame_2_yawn.png", "frame_3_lick.png",
-                    "frame_4_stretch.png", "frame_5_wave.png")
+                    "frame_4_stretch.png", "frame_5_wave.png", "frame_6_paw.png")
 
 USER_PET_DIR = os.path.join(os.path.expanduser("~"), ".workbuddy", "pet")
 STATUS_JSON = os.path.join(USER_PET_DIR, "status.json")
@@ -202,6 +202,34 @@ POUNCE_CHANCE_PER_TICK = 0.015       # 每帧扑击概率（~14fps → 平均5s�
 POUNCE_COOLDOWN = 6.0                # 扑击冷却
 POUNCE_WINDUP = 0.25                 # 扑击前蹲伏蓄力时间
 POUNCE_DURATION = 0.35               # 扑击动作持续时间
+
+# ---- 桌面老鼠 ----
+MOUSE_SIZE = 64                      # 老鼠精灵窗口尺寸（物理像素）
+MOUSE_ROAM_SPEED = 1.2               # 老鼠闲逛速度（px/帧）
+MOUSE_FLEE_SPEED = 3.2               # 老鼠逃跑速度
+MOUSE_FLEE_DIST = 220                # 猫靠近这个距离 → 老鼠开始逃跑
+MOUSE_CATCH_DIST = 85                # 猫到老鼠这个距离内 → 扑击命中
+MOUSE_HIDE_CHANCE = 0.002            # 每帧老鼠躲藏概率
+MOUSE_HIDE_DURATION = 3.0            # 老鼠躲藏时长（秒）
+MOUSE_DIRECTION_CHANGE = 0.02        # 每帧改变闲逛方向的概率
+CAT_CHASE_SPEED = 5.5                # 猫追逐老鼠时的移动速度
+CAT_CHASE_VIEW_DIST = 600            # 猫能发现老鼠的最远距离
+
+# ---- 喂鱼 ----
+FEED_AFFECTION = 5                   # 每次喂鱼好感度+5
+FEED_DAILY_LIMIT = 5                 # 每日喂鱼上限
+FEED_FULL_COUNT = 3                  # 连续喂多少次会饱
+FEED_FULL_DURATION = 30.0            # 饱腹持续时间（秒）
+FISH_FALL_SPEED = 5.0                # 鱼下落速度（px/帧）
+EAT_DURATION = 2.5                   # 吃鱼持续时间（秒）
+FISH_SIZE = 80                       # 鱼精灵尺寸
+
+# ---- 毛线球 ----
+YARN_SIZE = 64                       # 毛线球尺寸
+YARN_GRAVITY = 15.0                 # 毛线球重力
+YARN_FRICTION = 0.94                # 毛线球滚动摩擦
+YARN_BOUNCE = 0.35                  # 毛线球落地反弹系数
+YARN_CAT_PUSH = 8.0                 # 猫扑到时毛线球被弹开的速度
 
 # ============================================================
 #  爱心粒子系统（抚摸反馈）
@@ -567,6 +595,163 @@ class LaserDot:
         try:
             if self.renderer:
                 self.renderer.dispose()   # 释放 GDI 句柄，防泄漏
+            if self.hwnd:
+                ctypes.windll.user32.DestroyWindow(self.hwnd)
+            if hasattr(self, "_tk"):
+                self._tk.destroy()
+        except Exception:
+            pass
+        self.hwnd = 0
+        self.renderer = None
+
+
+# ============================================================
+#  桌面老鼠（独立分层窗口 + 自主 AI）
+#  状态：roaming 闲逛 / fleeing 逃跑 / hiding 躲藏 / caught 被抓
+# ============================================================
+class MouseSprite:
+    """桌面上一只会自己乱跑、被猫追的小老鼠。"""
+
+    def __init__(self, screen_w: int, screen_h: int) -> None:
+        self.size = MOUSE_SIZE
+        self.state = "roaming"
+        self.x = random.randint(100, max(101, screen_w - 100))
+        self.y = random.randint(100, max(101, screen_h - 200))
+        self.vx = random.choice([-1, 1]) * MOUSE_ROAM_SPEED
+        self.vy = random.choice([-1, 1]) * MOUSE_ROAM_SPEED * 0.3
+        self.facing = 1 if self.vx >= 0 else -1   # 1=朝右, -1=朝左
+        self.hide_until = 0.0
+        self.hwnd = 0
+        self.renderer: Optional[LayeredRenderer] = None
+        self._image: Optional[Image.Image] = None
+        self._create()
+
+    def _create(self) -> None:
+        try:
+            # 加载老鼠精灵
+            path = os.path.join(ASSETS_DIR, "frames", "mouse.png")
+            if os.path.exists(path):
+                self._image = Image.open(path).convert("RGBA")
+            else:
+                # 兜底：画一个灰色椭圆当老鼠
+                self._image = Image.new("RGBA", (self.size, self.size), (0, 0, 0, 0))
+                d = ImageDraw.Draw(self._image)
+                d.ellipse([8, 20, 56, 52], fill=(120, 120, 120, 255))
+                d.ellipse([40, 12, 60, 32], fill=(140, 140, 140, 255))
+            self._tk = tk.Tk()
+            self._tk.overrideredirect(True)
+            self._tk.attributes("-topmost", True)
+            self._tk.geometry(f"{self.size}x{self.size}+{int(self.x)}+{int(self.y)}")
+            self._tk.withdraw()
+            self._tk.update_idletasks()
+            hwnd = _get_toplevel_hwnd(int(self._tk.winfo_id()))
+            r = LayeredRenderer(hwnd, self.size, self.size)
+            if r.ok:
+                self.hwnd = hwnd
+                self.renderer = r
+                self._draw()
+                self._tk.deiconify()
+        except Exception:
+            self.hwnd = 0
+            self.renderer = None
+
+    def _draw(self) -> None:
+        if not self.renderer or not self._image:
+            return
+        img = self._image
+        if self.facing > 0:
+            img = img.transpose(Image.FLIP_LEFT_RIGHT)
+        self.renderer.update(_to_bgra(img))
+
+    def _move_window(self) -> None:
+        if not self.hwnd:
+            return
+        u = ctypes.windll.user32
+        u.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND,
+                                   ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_int, ctypes.c_int, wintypes.UINT]
+        u.SetWindowPos(self.hwnd, wintypes.HWND(-1), int(self.x), int(self.y),
+                       0, 0, SWP_NOSIZE | SWP_NOACTIVATE)
+
+    def update(self, cat_cx: int, cat_cy: int, screen_w: int, screen_h: int) -> str:
+        """每帧更新老鼠 AI，返回当前状态。"""
+        now = time.time()
+        if self.state == "hiding":
+            if now >= self.hide_until:
+                # 躲藏结束，在随机位置重新出现
+                self.x = random.randint(50, max(51, screen_w - 50))
+                self.y = random.randint(50, max(51, screen_h - 100))
+                self.state = "roaming"
+                if self.hwnd:
+                    ctypes.windll.user32.ShowWindow(self.hwnd, 5)  # SW_SHOW
+                    self._move_window()
+            return self.state
+
+        if self.state == "caught":
+            return self.state
+
+        # 计算到猫的距离
+        dist = math.hypot(self.x - cat_cx, self.y - cat_cy)
+
+        if dist < MOUSE_FLEE_DIST:
+            # 猫靠近了，逃跑！
+            self.state = "fleeing"
+            dx = self.x - cat_cx
+            dy = self.y - cat_cy
+            d = max(1.0, math.hypot(dx, dy))
+            self.vx = dx / d * MOUSE_FLEE_SPEED
+            self.vy = dy / d * MOUSE_FLEE_SPEED * 0.5
+        else:
+            self.state = "roaming"
+            # 偶尔改变方向
+            if random.random() < MOUSE_DIRECTION_CHANGE:
+                angle = random.uniform(0, math.pi * 2)
+                self.vx = math.cos(angle) * MOUSE_ROAM_SPEED
+                self.vy = math.sin(angle) * MOUSE_ROAM_SPEED * 0.4
+            # 偶尔躲起来
+            if random.random() < MOUSE_HIDE_CHANCE:
+                self.state = "hiding"
+                self.hide_until = now + MOUSE_HIDE_DURATION
+                if self.hwnd:
+                    ctypes.windll.user32.ShowWindow(self.hwnd, 0)  # SW_HIDE
+                return self.state
+
+        # 更新位置
+        self.x += self.vx
+        self.y += self.vy
+        # 边界反弹
+        if self.x < 10:
+            self.x = 10
+            self.vx = abs(self.vx)
+        elif self.x > screen_w - self.size - 10:
+            self.x = screen_w - self.size - 10
+            self.vx = -abs(self.vx)
+        if self.y < 10:
+            self.y = 10
+            self.vy = abs(self.vy)
+        elif self.y > screen_h - self.size - 10:
+            self.y = screen_h - self.size - 10
+            self.vy = -abs(self.vy)
+
+        # 更新朝向
+        new_facing = 1 if self.vx >= 0 else -1
+        if new_facing != self.facing:
+            self.facing = new_facing
+            self._draw()
+
+        self._move_window()
+        return self.state
+
+    def catch(self) -> None:
+        """被猫抓住了。"""
+        self.state = "caught"
+        if self.hwnd:
+            ctypes.windll.user32.ShowWindow(self.hwnd, 0)  # 隐藏
+
+    def destroy(self) -> None:
+        try:
+            if self.renderer:
+                self.renderer.dispose()
             if self.hwnd:
                 ctypes.windll.user32.DestroyWindow(self.hwnd)
             if hasattr(self, "_tk"):
@@ -977,14 +1162,24 @@ def _composite(cat: Image.Image, state: str, t: float,
 
     # 扑击状态叠加
     if pounce_state == "windup":
-        oy += 5    # 蓄力蹲伏
+        oy += 10   # 蓄力蹲伏下沉
     elif pounce_state == "pouncing":
-        ox += facing * 12  # 前冲
+        ox += facing * 20  # 前冲
 
-    # 朝向翻转（朝左时水平镜像）
+    # 朝向翻转（朝右时水平镜像，因为原始帧面朝左）
     cat_to_draw = cat
-    if facing < 0:
+    if facing > 0:
         cat_to_draw = cat.transpose(Image.FLIP_LEFT_RIGHT)
+
+    # 扑击缩放变形（在翻转之后，让动作明显）
+    if pounce_state == "windup":
+        cw, ch = cat_to_draw.size
+        cat_to_draw = cat_to_draw.resize(
+            (int(cw * 1.10), int(ch * 0.85)), Image.LANCZOS)
+    elif pounce_state == "pouncing":
+        cw, ch = cat_to_draw.size
+        cat_to_draw = cat_to_draw.resize(
+            (int(cw * 1.22), int(ch * 0.92)), Image.LANCZOS)
 
     cx = (WIN_W - cat_to_draw.width) // 2 + ox + bx
     cy = (WIN_H - cat_to_draw.height) // 2 + 12 + oy + by
@@ -1273,6 +1468,13 @@ class PetApp:
 
         self.cat_img = load_sprite()  # 默认坐姿帧（其他状态 / 帧缺失回退用）
         self.frames = load_idle_frames()  # idle 5 帧循环（坐/闭眼/嗷呜/舔爪/伸懒腰）
+        # 加载鱼精灵
+        fish_path = os.path.join(FRAMES_DIR, "fish.png")
+        if os.path.isfile(fish_path):
+            self.fish_image = Image.open(fish_path).convert("RGBA")
+        yarn_path = os.path.join(FRAMES_DIR, "yarn.png")
+        if os.path.isfile(yarn_path):
+            self.yarn_image = Image.open(yarn_path).convert("RGBA")
         self.state, self.msg, self.step, self.progress = read_status()
         self._boot = True  # 首次轮询要清掉可能残留的"工作中"态，从 idle 重新开始
         self.prefs = read_prefs()
@@ -1319,6 +1521,27 @@ class PetApp:
         self.laser_target_x = 0
         self.laser_target_y = 0
         self.laser_caught_until = 0.0
+        # ---- 桌面老鼠 ----
+        self.mouse_active = False
+        self.mouse: Optional[MouseSprite] = None
+        self.mouse_caught_until = 0.0
+        # ---- 喂鱼 ----
+        self.fish_state = None             # None/falling/eating
+        self.fish_x = 0
+        self.fish_y = 0
+        self.eating_until = 0.0
+        self.feeds_today = 0
+        self.last_feed_date = ""
+        self.full_until = 0.0
+        # ---- 毛线球 ----
+        self.yarn_active = False
+        self.yarn_x = 0
+        self.yarn_y = 0
+        self.yarn_vx = 0.0
+        self.yarn_vy = 0.0
+        self.yarn_rot = 0.0
+        self.yarn_play_until = 0.0
+        self.yarn_groom_until = 0.0
         # ---- 窗口栖息 ----
         self.perched = False
         self.perched_hwnd = 0
@@ -1480,6 +1703,18 @@ class PetApp:
         if self.laser_active:
             self._update_laser_chase()
 
+        # ---- 桌面老鼠追逐 ----
+        if self.mouse_active:
+            self._update_mouse_hunt()
+
+        # ---- 喂鱼（下落+吃鱼）----
+        if self.fish_state is not None:
+            self._update_fish()
+
+        # ---- 毛线球 ----
+        if self.yarn_active:
+            self._update_yarn()
+
         # ---- 窗口栖息跟随 ----
         if self.perched:
             self._update_perch()
@@ -1557,6 +1792,17 @@ class PetApp:
                            facing=self.facing,
                            hearts=self.hearts)
 
+        # 画鱼（下落/吃鱼时显示）
+        if self.fish_state is not None and self.fish_image is not None:
+            frame.alpha_composite(self.fish_image,
+                                  (int(self.fish_x), int(self.fish_y)))
+
+        # 画毛线球（带旋转）
+        if self.yarn_active and self.yarn_image is not None:
+            yarn_rotated = self.yarn_image.rotate(self.yarn_rot % 360, resample=Image.BICUBIC, expand=False)
+            frame.alpha_composite(yarn_rotated,
+                                  (int(self.yarn_x), int(self.yarn_y)))
+
         # 逻辑画布 → 物理尺寸（插画风用 LANCZOS 平滑，保持和帧一致）
         if DPI_SCALE != 1.0:
             frame = frame.resize((PHYS_W, PHYS_H), Image.LANCZOS)
@@ -1588,7 +1834,7 @@ class PetApp:
             "groom":      3,   # 舔毛姿势
             "stretch":    4,   # 伸懒腰姿势（明显变宽变扁）
             "yawn":       2,   # 打哈欠姿势
-            "paw_lick":   3,   # 舔爪姿势
+            "paw_lick":   3,   # 舔爪姿势`r`n            "paw_swipe":  6,   # 伸爪拨球姿势
         }
         base_idx = behavior_frame_map.get(self.behavior, 0)
 
@@ -1862,6 +2108,8 @@ class PetApp:
                           last_x_root=e.x_root, last_y_root=e.y_root)
         # 抓起：解除栖息（否则拖完松手 _update_perch 会把猫拉回窗口标题栏）
         self.perched = False
+        # 抓起：打断喂鱼
+        self.fish_state = None
         # 抓起：进入拖拽状态，瘫软
         self.phys_state = "dragged"
         self.phys_vy = 0
@@ -1942,6 +2190,9 @@ class PetApp:
         menu.add_separator()
         menu.add_command(label="去窗口上栖息", command=lambda: self._perch_on_foreground())
         menu.add_command(label="激光笔", command=self._toggle_laser)
+        menu.add_command(label="放只老鼠", command=self._toggle_mouse)
+        menu.add_command(label="喂鱼", command=self._feed_fish)
+        menu.add_command(label="放毛线球", command=self._toggle_yarn)
         menu.add_command(label="叫醒它", command=lambda: self._wake_up())
         menu.add_command(label="重置位置", command=lambda: self._reset_position())
         menu.add_separator()
@@ -2133,7 +2384,7 @@ class PetApp:
             self.phys_state = "ground"
 
     def _quit_app(self) -> None:
-        """退出：先清理激光笔红点等独立窗口，再销毁主窗口。"""
+        """退出：先清理激光笔红点、老鼠等独立窗口，再销毁主窗口。"""
         try:
             if self.laser_dot:
                 self.laser_dot.destroy()
@@ -2141,14 +2392,176 @@ class PetApp:
         except Exception:
             pass
         try:
+            if self.mouse:
+                self.mouse.destroy()
+                self.mouse = None
+        except Exception:
+            pass
+        try:
             self.root.destroy()
         except Exception:
             pass
+
+    def _toggle_mouse(self) -> None:
+        """桌面老鼠开关：放出/收回老鼠。"""
+        self.mouse_active = not self.mouse_active
+        if self.mouse_active:
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
+            self.mouse = MouseSprite(sw, sh)
+            self.say("有老鼠！")
+            self.last_interact = time.time()
+            self.behavior = "lookaround"
+        else:
+            if self.mouse:
+                self.mouse.destroy()
+                self.mouse = None
+            self.say("老鼠跑了")
+
+    def _feed_fish(self) -> None:
+        """右键喂鱼：鱼从上方掉落，猫吃鱼，好感度+。"""
+        now = time.time()
+        # 正在吃鱼，忽略
+        if self.fish_state is not None:
+            return
+        # 重置每日计数
+        today = time.strftime("%Y-%m-%d")
+        if today != self.last_feed_date:
+            self.feeds_today = 0
+            self.last_feed_date = today
+        # 每日上限
+        if self.feeds_today >= FEED_DAILY_LIMIT:
+            self.say("今天吃够啦~")
+            return
+        # 饱腹
+        if now < self.full_until:
+            self.say("吃不下了…")
+            return
+        # 开始喂鱼
+        self.fish_state = "falling"
+        self.fish_x = (WIN_W - FISH_SIZE) // 2
+        self.fish_y = 0  # 从画布顶部开始，完整显示
+        self.say("鱼！")
+        self.last_interact = now
+        self.behavior = "sit"
+
+    def _update_fish(self) -> None:
+        """鱼下落 + 吃鱼状态更新。"""
+        now = time.time()
+        if self.fish_state == "falling":
+            self.fish_y += FISH_FALL_SPEED
+            # 落到猫面前（窗口底部靠前）
+            target_y = WIN_H - FISH_SIZE - 10  # 落到猫前方底部
+            if self.fish_y >= target_y:
+                self.fish_y = target_y
+                self.fish_state = "eating"
+                self.eating_until = now + EAT_DURATION
+                self.behavior = "groom"  # 低头舔的姿势
+        elif self.fish_state == "eating":
+            if now >= self.eating_until:
+                # 吃完了
+                self.fish_state = None
+                self.feeds_today += 1
+                self._add_affection(FEED_AFFECTION)
+                self._play_sound("pat_happy")
+                self.say(random.choice(["好吃！", "还要~", "喵~"]))
+                self.behavior = "sit"
+                # 连续喂多了会饱
+                if self.feeds_today >= FEED_FULL_COUNT:
+                    self.full_until = now + FEED_FULL_DURATION
+                self.last_interact = now
+
+
+    def _toggle_yarn(self) -> None:
+        """右键放/收回毛线球。"""
+        self.yarn_active = not self.yarn_active
+        if self.yarn_active:
+            self.yarn_x = (WIN_W - YARN_SIZE) // 2  # 猫正前方正中间
+            self.yarn_y = WIN_H - YARN_SIZE - 40  # 离猫近一点
+            self.yarn_vx = random.uniform(-1, 1)
+            self.yarn_vy = 0
+            self.yarn_rot = 0
+            self.say("毛线球！")
+            self.last_interact = time.time()
+            self.behavior = "lookaround"
+        else:
+            self.say("收起来啦")
+
+    def _update_yarn(self) -> None:
+        """毛线球物理 + 猫追逐玩耍。"""
+        if not self.yarn_active:
+            return
+        now = time.time()
+        # 物理：重力
+        self.yarn_vy += YARN_GRAVITY
+        self.yarn_x += self.yarn_vx
+        self.yarn_y += self.yarn_vy
+        # 边界：左右墙反弹
+        if self.yarn_x < 0:
+            self.yarn_x = 0
+            self.yarn_vx = abs(self.yarn_vx) * YARN_BOUNCE
+        elif self.yarn_x > WIN_W - YARN_SIZE:
+            self.yarn_x = WIN_W - YARN_SIZE
+            self.yarn_vx = -abs(self.yarn_vx) * YARN_BOUNCE
+        # 边界：底部反弹+摩擦
+        floor_y = WIN_H - YARN_SIZE - 5
+        if self.yarn_y >= floor_y:
+            self.yarn_y = floor_y
+            if abs(self.yarn_vy) > 2:
+                self.yarn_vy = -abs(self.yarn_vy) * YARN_BOUNCE
+            else:
+                self.yarn_vy = 0
+            self.yarn_vx *= YARN_FRICTION
+            if abs(self.yarn_vx) < 0.3:
+                self.yarn_vx = 0
+        # 旋转（跟随水平速度）
+        self.yarn_rot += self.yarn_vx * 3
+
+        # 猫玩毛线球（转身+用爪子拨球）
+        if self.phys_state == "ground" and self.state != "sleeping":
+            cat_cx = WIN_W // 2
+            cat_cy = WIN_H - 70
+            yarn_cx = self.yarn_x + YARN_SIZE // 2
+            yarn_cy = self.yarn_y + YARN_SIZE // 2
+            dx = yarn_cx - cat_cx
+            dy = yarn_cy - cat_cy
+            dist = (dx * dx + dy * dy) ** 0.5
+            # 转身朝向毛线球
+            if abs(dx) > 5:
+                self.facing = 1 if dx > 0 else -1
+            # 玩毛线球时禁止行为状态机自动切换（推迟5秒）
+            self.behavior_check_at = now + 5.0
+            # 周期性用爪子拨球/勾球
+            if now >= self.yarn_play_until:
+                self.yarn_play_until = now + random.uniform(1.0, 1.8)
+                self.yarn_groom_until = now + 0.7
+                self.behavior = "paw_swipe"  # 伸爪拨球
+                # 用扑击状态做压扁拉伸动作，配合伸爪帧
+                self.pounce_state = "pouncing"
+                self.pounce_until = now + 0.5
+                # 球远了就勾回来，近了就拨出去
+                if dist > 80:
+                    push_dir = -1 if dx > 0 else 1  # 向猫
+                else:
+                    push_dir = 1 if dx >= 0 else -1  # 向外拨
+                self.yarn_vx = push_dir * random.uniform(2, 4)
+                self.yarn_vy = -random.uniform(2, 4)
+                self._play_sound("pounce")
+                if random.random() < 0.25:
+                    self.say(random.choice(["好玩！", "喵~", "再来！"]))
+                self.last_interact = now
+            elif now >= self.yarn_groom_until:
+                self.behavior = "lookaround"  # 专注看着球
+                if self.pounce_state != "idle" and now >= self.pounce_until:
+                    self.pounce_state = "idle"
 
     def _update_laser_chase(self) -> None:
         """激光笔追逐逻辑：红点全局跟随光标（带延迟），猫向红点移动。"""
         if not self.laser_active or not self.laser_dot:
             return
+        # 追逐时自动解除栖息
+        if self.perched:
+            self.perched = False
         now = time.time()
         # 红点全局跟随光标（平滑跟随，不是完全跟随，让猫有机会抓住）
         try:
@@ -2195,6 +2608,102 @@ class PetApp:
         # 更新红点位置
         if self.laser_dot and self.laser_dot.hwnd:
             self.laser_dot.move(int(self.laser_target_x), int(self.laser_target_y))
+
+    def _update_mouse_hunt(self) -> None:
+        """桌面老鼠追逐逻辑：老鼠自主 AI，猫发现后追逐、扑击。"""
+        if not self.mouse_active or not self.mouse:
+            return
+        # 追逐时自动解除栖息
+        if self.perched:
+            self.perched = False
+        now = time.time()
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        win_cx = self.root.winfo_x() + PHYS_W // 2
+        win_cy = self.root.winfo_y() + PHYS_H // 2
+
+        # 更新老鼠 AI
+        mouse_state = self.mouse.update(win_cx, win_cy, sw, sh)
+
+        # 老鼠被抓住后：庆祝几秒，然后收回
+        if mouse_state == "caught":
+            if now >= self.mouse_caught_until:
+                self.mouse.destroy()
+                self.mouse = None
+                self.mouse_active = False
+                self.behavior = "sit"
+            return
+
+        # 老鼠躲起来了：猫困惑张望，不移动
+        if mouse_state == "hiding":
+            self.behavior = "lookaround"
+            return
+
+        # 计算猫到老鼠的距离
+        mouse_cx = self.mouse.x + MOUSE_SIZE // 2
+        mouse_cy = self.mouse.y + MOUSE_SIZE // 2
+        dist = math.hypot(mouse_cx - win_cx, mouse_cy - win_cy)
+
+        # 猫在视野内发现老鼠 → 追逐
+        if dist < CAT_CHASE_VIEW_DIST and self.phys_state == "ground":
+            dx = mouse_cx - win_cx
+            dy = mouse_cy - win_cy
+            self.facing = 1 if dx >= 0 else -1
+            self.behavior = "lookaround"  # 警觉状
+
+            # 距离够近 → 扑击
+            if dist < MOUSE_CATCH_DIST and self.pounce_state == "idle" \
+                    and now >= self.pounce_cooldown_until:
+                self.pounce_state = "windup"
+                self.pounce_until = now + POUNCE_WINDUP
+            elif self.pounce_state == "windup" and now >= self.pounce_until:
+                self.pounce_state = "pouncing"
+                self.pounce_until = now + POUNCE_DURATION
+                self._play_sound("pounce")
+            elif self.pounce_state == "pouncing":
+                # 扑击中向前冲刺，同时检测命中
+                d = max(1.0, dist)
+                sprint_speed = CAT_CHASE_SPEED * 2.5
+                nx = self.root.winfo_x() + int(dx / d * sprint_speed)
+                ny = self.root.winfo_y() + int(dy / d * sprint_speed)
+                nx = max(0, min(nx, max(0, sw - PHYS_W)))
+                ny = max(0, min(ny, max(0, sh - PHYS_H)))
+                self.root.geometry(f"+{nx}+{ny}")
+                # 重新计算距离（冲刺后）
+                win_cx2 = nx + PHYS_W // 2
+                win_cy2 = ny + PHYS_H // 2
+                dist2 = math.hypot(mouse_cx - win_cx2, mouse_cy - win_cy2)
+                if dist2 < MOUSE_CATCH_DIST + 30:
+                    self.mouse.catch()
+                    self.mouse_caught_until = now + 2.0
+                    self.pounce_state = "idle"
+                    self.pounce_cooldown_until = now + POUNCE_COOLDOWN
+                    self._play_sound("pat_happy")
+                    self.say(random.choice(["抓到了！", "我的猎物！", "喵哈哈"]))
+                    self.stats["total_pats"] = int(self.stats.get("total_pats", 0)) + 1
+                    write_stats(self.stats)
+                elif now >= self.pounce_until:
+                    self.pounce_state = "idle"
+                    self.pounce_cooldown_until = now + POUNCE_COOLDOWN
+            elif self.pounce_state == "windup":
+                # 蓄力时缓慢逼近
+                d = max(1.0, dist)
+                nx = self.root.winfo_x() + int(dx / d * CAT_CHASE_SPEED * 0.5)
+                ny = self.root.winfo_y() + int(dy / d * CAT_CHASE_SPEED * 0.5)
+                nx = max(0, min(nx, max(0, sw - PHYS_W)))
+                ny = max(0, min(ny, max(0, sh - PHYS_H)))
+                self.root.geometry(f"+{nx}+{ny}")
+            else:
+                # 还没到扑击距离，向老鼠移动
+                d = max(1.0, dist)
+                nx = self.root.winfo_x() + int(dx / d * CAT_CHASE_SPEED)
+                ny = self.root.winfo_y() + int(dy / d * CAT_CHASE_SPEED)
+                nx = max(0, min(nx, max(0, sw - PHYS_W)))
+                ny = max(0, min(ny, max(0, sh - PHYS_H)))
+                self.root.geometry(f"+{nx}+{ny}")
+        else:
+            # 老鼠太远或猫不在地面，放弃追逐
+            pass
 
     def _pat(self) -> None:
         """被摸一下：记次数、判连点、按心情回话、冒爱心粒子。"""
