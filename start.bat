@@ -1,7 +1,10 @@
 @echo off
 rem Desktop pet launcher (double-click to run)
 setlocal
-set "PYEX=C:\Users\Matebook 14\.workbuddy\binaries\python\envs\pet\Scripts\pythonw.exe"
-set "SCRIPT=%~dp0pet.py"
-start "" "%PYEX%" "%SCRIPT%"
+where pythonw >nul 2>nul
+if %errorlevel%==0 (
+    start "" pythonw "%~dp0pet.py"
+) else (
+    start "" python "%~dp0pet.py"
+)
 endlocal

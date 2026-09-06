@@ -13,7 +13,7 @@ import os
 from collections import deque
 from PIL import Image, ImageDraw
 
-FRAMES_DIR = r"C:\Users\Matebook 14\WorkBuddy\2026-09-04-23-55-11\pet\assets\frames"
+FRAMES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "frames")
 
 # 猫脸在 320x320 画布中的大致位置（鼻子/嘴，用于打哈欠、舔）
 FACE_CX = 160
