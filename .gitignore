@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller 打包产物
+build/
+dist/
+*.spec
+*.zip
+
+# 日志和临时文件
+*.log
+stderr.txt
+launch.log
+
+# 原始素材备份（不需要同步）
+assets/_archive/
+
+# 调试预览图
+preview/
+
+# 系统文件
+Thumbs.db
+.DS_Store
