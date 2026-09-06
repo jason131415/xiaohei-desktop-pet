@@ -231,6 +231,15 @@ YARN_FRICTION = 0.94                # 毛线球滚动摩擦
 YARN_BOUNCE = 0.35                  # 毛线球落地反弹系数
 YARN_CAT_PUSH = 8.0                 # 猫扑到时毛线球被弹开的速度
 
+# ---- 逗猫棒 ----
+WAND_SIZE = 80                        # 逗猫棒尺寸
+WAND_SWING_SPEED = 3.0                # 逗猫棒摆动速度
+WAND_CATCH_DIST = 90                  # 猫能抓到逗猫棒的距离
+
+# ---- 番茄钟 ----
+POMODORO_FOCUS = 25 * 60               # 专注时长（秒）
+POMODORO_BREAK = 5 * 60                # 休息时长（秒）
+
 # ============================================================
 #  爱心粒子系统（抚摸反馈）
 # ============================================================
@@ -609,6 +618,77 @@ class LaserDot:
 #  桌面老鼠（独立分层窗口 + 自主 AI）
 #  状态：roaming 闲逛 / fleeing 逃跑 / hiding 躲藏 / caught 被抓
 # ============================================================
+
+
+class WandSprite:
+    """逗猫棒：独立分层窗口，显示羽毛逗猫棒，跟随光标带摆动。"""
+
+    def __init__(self) -> None:
+        self.hwnd = 0
+        self.renderer = None
+        self.size = 80
+        self.angle = 0.0
+        self._base_image: Optional[Image.Image] = None
+        wand_path = os.path.join(FRAMES_DIR, "wand.png")
+        if os.path.isfile(wand_path):
+            self._base_image = Image.open(wand_path).convert("RGBA")
+        self._create()
+
+    def _create(self) -> None:
+        try:
+            self._tk = tk.Tk()
+            self._tk.overrideredirect(True)
+            self._tk.attributes("-topmost", True)
+            self._tk.geometry(f"{self.size}x{self.size}+0+0")
+            self._tk.withdraw()
+            self._tk.update_idletasks()
+            hwnd = _get_toplevel_hwnd(int(self._tk.winfo_id()))
+            r = LayeredRenderer(hwnd, self.size, self.size)
+            if r.ok:
+                self.hwnd = hwnd
+                self.renderer = r
+                self._draw(0.0)
+                self._tk.deiconify()
+        except Exception:
+            self.hwnd = 0
+            self.renderer = None
+
+    def _draw(self, angle: float) -> None:
+        if not self.renderer or self._base_image is None:
+            return
+        img = Image.new("RGBA", (self.size, self.size), (0, 0, 0, 0))
+        rotated = self._base_image.rotate(angle, resample=Image.BICUBIC, expand=False)
+        img.alpha_composite(rotated, (0, 0))
+        self.renderer.update(_to_bgra(img))
+
+    def update(self, angle: float) -> None:
+        """更新摆动角度并重绘。"""
+        self.angle = angle
+        self._draw(angle)
+
+    def move(self, x: int, y: int) -> None:
+        if not self.hwnd:
+            return
+        u = ctypes.windll.user32
+        u.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND,
+                                   ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_int, ctypes.c_int, wintypes.UINT]
+        u.SetWindowPos(self.hwnd, wintypes.HWND(-1), x, y, 0, 0,
+                       SWP_NOSIZE | SWP_NOACTIVATE)
+
+    def destroy(self) -> None:
+        try:
+            if self.renderer:
+                self.renderer.dispose()
+            if self.hwnd:
+                ctypes.windll.user32.DestroyWindow(self.hwnd)
+            if hasattr(self, "_tk"):
+                self._tk.destroy()
+        except Exception:
+            pass
+        self.hwnd = 0
+        self.renderer = None
+
 class MouseSprite:
     """桌面上一只会自己乱跑、被猫追的小老鼠。"""
 
@@ -1542,6 +1622,15 @@ class PetApp:
         self.yarn_rot = 0.0
         self.yarn_play_until = 0.0
         self.yarn_groom_until = 0.0
+        # ---- 逗猫棒 ----
+        self.wand_active = False
+        self.wand_sprite = None
+        self.wand_angle = 0.0
+        self.wand_jump_until = 0.0
+        # ---- 番茄钟 ----
+        self.pomodoro_mode = None  # None/focus/break
+        self.pomodoro_end_at = 0.0
+        self.pomodoro_cycles = 0
         # ---- 窗口栖息 ----
         self.perched = False
         self.perched_hwnd = 0
@@ -1685,7 +1774,7 @@ class PetApp:
                 write_status("sleeping", "打盹中…")
 
         # ---- 行为状态机（idle 时才运行；其他状态由 agent 驱动）----
-        if self.state == "idle" and now - self.behavior_check_at >= BEHAVIOR_CHECK_INTERVAL:
+        if self.state == "idle" and now - self.behavior_check_at >= BEHAVIOR_CHECK_INTERVAL and self.pomodoro_mode != "focus":
             self.behavior_check_at = now
             self._update_behavior()
         # ---- 微动作（在主行为期间叠加小动作）----
@@ -1715,6 +1804,13 @@ class PetApp:
         if self.yarn_active:
             self._update_yarn()
 
+        # ---- 逗猫棒 ----
+        if self.wand_active:
+            self._update_wand()
+
+        # ---- 番茄钟 ----
+        self._update_pomodoro()
+
         # ---- 窗口栖息跟随 ----
         if self.perched:
             self._update_perch()
@@ -1722,8 +1818,8 @@ class PetApp:
         # ---- 爱心粒子更新 ----
         self._update_hearts()
 
-        # ---- 光标互动：注视方向 + 扑击 ----
-        if self.state == "idle" and self.phys_state == "ground" and self.cursor_in_window:
+        # ---- 光标互动：注视方向 + 扑击（专注模式下不扑击）----
+        if self.state == "idle" and self.phys_state == "ground" and self.cursor_in_window and self.pomodoro_mode != "focus":
             win_x = self.root.winfo_x() + PHYS_W // 2
             win_y = self.root.winfo_y() + PHYS_H // 2
             dx = self.cursor_x - win_x
@@ -2190,6 +2286,10 @@ class PetApp:
         menu.add_separator()
         menu.add_command(label="去窗口上栖息", command=lambda: self._perch_on_foreground())
         menu.add_command(label="激光笔", command=self._toggle_laser)
+        menu.add_command(label="逗猫棒", command=self._toggle_wand)
+        menu.add_command(label="番茄钟: 专注25分", command=lambda: self._start_pomodoro("focus"))
+        menu.add_command(label="番茄钟: 休息5分", command=lambda: self._start_pomodoro("break"))
+        menu.add_command(label="停止番茄钟", command=self._stop_pomodoro)
         menu.add_command(label="放只老鼠", command=self._toggle_mouse)
         menu.add_command(label="喂鱼", command=self._feed_fish)
         menu.add_command(label="放毛线球", command=self._toggle_yarn)
@@ -2554,6 +2654,131 @@ class PetApp:
                 self.behavior = "lookaround"  # 专注看着球
                 if self.pounce_state != "idle" and now >= self.pounce_until:
                     self.pounce_state = "idle"
+
+
+    def _toggle_wand(self) -> None:
+        """右键开/关逗猫棒。和激光笔互斥。"""
+        self.wand_active = not self.wand_active
+        if self.wand_active:
+            # 关闭激光笔
+            if self.laser_active:
+                self._toggle_laser()
+            self.wand_sprite = WandSprite()
+            self.say("逗猫棒！")
+            self.last_interact = time.time()
+            self.behavior = "lookaround"
+        else:
+            if self.wand_sprite:
+                self.wand_sprite.destroy()
+                self.wand_sprite = None
+            self.say("不玩啦")
+
+    def _update_wand(self) -> None:
+        """逗猫棒跟随光标+摆动，猫追逐扑击，扑到后逗猫棒跳开。"""
+        if not self.wand_active or not self.wand_sprite:
+            return
+        now = time.time()
+        # 追逐时自动解除栖息
+        if self.perched:
+            self.perched = False
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+
+        # 逗猫棒跟随光标（带摆动偏移）
+        try:
+            px, py = self.root.winfo_pointerxy()
+        except Exception:
+            px, py = self.cursor_x, self.cursor_y
+        self.wand_angle += WAND_SWING_SPEED
+        swing_x = int(math.sin(self.wand_angle * 0.1) * 15)
+        swing_y = int(math.cos(self.wand_angle * 0.08) * 10)
+        wand_x = max(0, min(px + swing_x - WAND_SIZE // 2, sw - WAND_SIZE))
+        wand_y = max(0, min(py + swing_y - WAND_SIZE // 2, sh - WAND_SIZE))
+
+        # 猫扑到时逗猫棒跳开
+        win_cx = self.root.winfo_x() + PHYS_W // 2
+        win_cy = self.root.winfo_y() + PHYS_H // 2
+        wand_cx = wand_x + WAND_SIZE // 2
+        wand_cy = wand_y + WAND_SIZE // 2
+        dist = math.hypot(wand_cx - win_cx, wand_cy - win_cy)
+
+        if dist < WAND_CATCH_DIST and self.pounce_state == "idle" \
+                and now >= self.wand_jump_until:
+            # 猫扑击
+            self.pounce_state = "windup"
+            self.pounce_until = now + 0.2
+            self._play_sound("pounce")
+            # 逗猫棒随机跳开
+            jump_dx = random.choice([-1, 1]) * random.randint(150, 300)
+            jump_dy = random.randint(-100, 100)
+            wand_x = max(0, min(wand_x + jump_dx, sw - WAND_SIZE))
+            wand_y = max(0, min(wand_y + jump_dy, sh - WAND_SIZE))
+            self.wand_jump_until = now + 1.0
+            self.say(random.choice(["没抓到！", "再来~", "喵！"]))
+            self.last_interact = now
+
+        # 移动逗猫棒窗口并更新摆动
+        self.wand_sprite.move(wand_x, wand_y)
+        self.wand_sprite.update(self.wand_angle % 360)
+
+        # 猫追逐逗猫棒
+        if self.phys_state == "ground" and dist > WAND_CATCH_DIST:
+            dx = wand_cx - win_cx
+            dy = wand_cy - win_cy
+            d = max(1.0, dist)
+            speed = CAT_CHASE_SPEED
+            nx = self.root.winfo_x() + int(dx / d * speed)
+            ny = self.root.winfo_y() + int(dy / d * speed)
+            nx = max(0, min(nx, max(0, sw - PHYS_W)))
+            ny = max(0, min(ny, max(0, sh - PHYS_H)))
+            self.root.geometry(f"+{nx}+{ny}")
+            self.facing = 1 if dx >= 0 else -1
+            self.behavior = "lookaround"
+
+
+    def _start_pomodoro(self, mode: str) -> None:
+        """开始番茄钟。mode: focus/break"""
+        now = time.time()
+        self.pomodoro_mode = mode
+        if mode == "focus":
+            self.pomodoro_end_at = now + POMODORO_FOCUS
+            self.say("专注开始！我陪你~")
+            self.behavior = "sit"
+        else:
+            self.pomodoro_end_at = now + POMODORO_BREAK
+            self.say("休息一下~")
+        self.last_interact = now
+        self._play_sound("pat_happy")
+
+    def _stop_pomodoro(self) -> None:
+        """停止番茄钟。"""
+        self.pomodoro_mode = None
+        self.pomodoro_end_at = 0.0
+        self.say("番茄钟停止")
+
+    def _update_pomodoro(self) -> None:
+        """番茄钟计时，到点自动切换。"""
+        if self.pomodoro_mode is None:
+            return
+        now = time.time()
+        if now >= self.pomodoro_end_at:
+            if self.pomodoro_mode == "focus":
+                # 专注结束 → 休息
+                self.pomodoro_mode = "break"
+                self.pomodoro_end_at = now + POMODORO_BREAK
+                self.pomodoro_cycles += 1
+                self.say(f"专注完成！第{self.pomodoro_cycles}个，休息5分钟~")
+                self._play_sound("pat_happy")
+                # 庆祝：爱心粒子+小跳
+                for _ in range(3): self._spawn_heart(WIN_W//2 + random.randint(-30,30), WIN_H//2)
+                self.phys_state = "ground"
+            else:
+                # 休息结束 → 下一个专注
+                self.pomodoro_mode = "focus"
+                self.pomodoro_end_at = now + POMODORO_FOCUS
+                self.say("休息结束，继续加油！")
+                self.behavior = "sit"
+            self.last_interact = now
 
     def _update_laser_chase(self) -> None:
         """激光笔追逐逻辑：红点全局跟随光标（带延迟），猫向红点移动。"""
