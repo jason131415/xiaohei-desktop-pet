@@ -87,26 +87,35 @@ DEFAULT_PREFS = {
 def _init_dpi() -> float:
     """让进程感知 DPI，并返回缩放倍数。
 
-    不做这件事的话：
-      1. 系统会整体放大窗口，像素风的猫被拉糊
-      2. 窗口坐标与屏幕截图坐标系错位（实测本机 2x HiDPI）
+    用 GetDpiForSystem() 取真实 DPI（不受感知模式影响），
+    避免 SetProcessDpiAwareness 间歇性失败导致窗口大小不一致。
     """
+    # 尝试设置 DPI 感知（结果不重要，GetDpiForSystem 总是返回真实值）
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)   # PER_MONITOR_DPI_AWARE
     except Exception:
         try:
             ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
-            return 1.0
+            pass
+    # GetDpiForSystem 不受感知模式影响，Win10+ 稳定可用
+    try:
+        dpi = ctypes.windll.user32.GetDpiForSystem()
+        if dpi and dpi > 0:
+            return max(1.0, dpi / 96.0)
+    except Exception:
+        pass
+    # 回退：GetDeviceCaps（可能受感知模式影响，但比直接返回 1.0 好）
     try:
         u = ctypes.windll.user32
         g = ctypes.windll.gdi32
         u.GetDC.argtypes = [wintypes.HWND]
         u.GetDC.restype = wintypes.HDC
         g.GetDeviceCaps.argtypes = [wintypes.HDC, ctypes.c_int]
-        hdc = u.GetDC(None)
+        u.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+        hdc = u.GetDC(0)
         dpi = g.GetDeviceCaps(hdc, 88)        # LOGPIXELSX
-        u.ReleaseDC(None, hdc)
+        u.ReleaseDC(0, hdc)
         return max(1.0, dpi / 96.0)
     except Exception:
         return 1.0
@@ -1936,7 +1945,7 @@ class PetApp:
         menu.add_command(label="叫醒它", command=lambda: self._wake_up())
         menu.add_command(label="重置位置", command=lambda: self._reset_position())
         menu.add_separator()
-        menu.add_command(label="退出", command=self.root.destroy)
+        menu.add_command(label="退出", command=self._quit_app)
         menu.tk_popup(e.x_root, e.y_root)
 
     def on_mouse_move(self, e: tk.Event) -> None:
@@ -2122,6 +2131,19 @@ class PetApp:
                 self.laser_dot = None
             self.say("不玩了")
             self.phys_state = "ground"
+
+    def _quit_app(self) -> None:
+        """退出：先清理激光笔红点等独立窗口，再销毁主窗口。"""
+        try:
+            if self.laser_dot:
+                self.laser_dot.destroy()
+                self.laser_dot = None
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
     def _update_laser_chase(self) -> None:
         """激光笔追逐逻辑：红点全局跟随光标（带延迟），猫向红点移动。"""
